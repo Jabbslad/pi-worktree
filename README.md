@@ -15,7 +15,7 @@ Provides git worktree lifecycle management:
 
 ### `team-agents.ts` — Team Agent Coordination (SDK-based prototype)
 
-Multi-agent coordination with **in-process cwd switching**, enabling agents to move into git worktrees without restarting.
+Multi-agent coordination with **in-process cwd switching**, enabling agents to change working directories at runtime.
 
 ## Team Agents: SDK-based Architecture
 
@@ -23,7 +23,7 @@ This prototype replaces the original RPC subprocess approach with in-process `Ag
 
 ### Why?
 
-The original team-agents extension spawned each agent as an RPC subprocess with a fixed `cwd`. The RPC protocol has no command to change working directory, so once spawned, an agent could never switch to a worktree.
+The original team-agents extension spawned each agent as an RPC subprocess with a fixed `cwd`. The RPC protocol has no command to change working directory, so once spawned, an agent could never switch directories.
 
 The new `createAgentSessionRuntime()` API in pi uses a factory pattern that separates fixed inputs (what the agent IS) from cwd-bound inputs (where the agent WORKS). This enables clean rebuilds at a different cwd.
 
@@ -49,35 +49,36 @@ CreateAgentSessionRuntimeFactory
   │     → AgentSessionRuntime at /project
   │
   └── Switch:  dispose() old runtime
-               createAgentSessionRuntime(factory, { cwd: "/project/.pi/worktrees/my-branch" })
-               → AgentSessionRuntime at worktree path
+               createAgentSessionRuntime(factory, { cwd: "/new/path" })
+               → AgentSessionRuntime at new path
 ```
 
-### New Tool: `worktree_switch`
+### Tool: `agent_switch_cwd`
 
-Creates a git worktree and atomically switches an agent's cwd to it:
+Switches an agent's working directory to any path. The agent's session is recreated with all cwd-bound services rebuilt.
 
 ```
 Parameters:
   agent_name     - Name of the teammate to switch
-  worktree_name  - Optional worktree name (random if omitted)
-  branch_from    - Git ref to branch from (defaults to HEAD)
+  cwd            - New working directory path (absolute)
   initial_prompt - Instructions to send after switching
 ```
 
-**Example workflow:**
+**Example workflow with worktrees:**
 ```
 1. team_create({ team_name: "feature-work" })
 2. team_spawn({ name: "impl", agent: "coder", prompt: "..." })
-3. worktree_switch({ agent_name: "impl", worktree_name: "new-feature",
-                     initial_prompt: "Implement X in this isolated branch" })
-4. send_message({ to: "impl", message: "Also add tests" })
+3. worktree_create({ name: "new-feature" })              ← worktree extension
+4. agent_switch_cwd({ agent_name: "impl",                ← team-agents extension
+                      cwd: "/project/.pi/worktrees/new-feature",
+                      initial_prompt: "Implement X in this isolated branch" })
+5. send_message({ to: "impl", message: "Also add tests" })
 ```
 
 ### Trade-offs
 
 **Gained:**
-- cwd switching — agents can move to worktrees, subdirectories, or any path
+- cwd switching — agents can move to any directory at runtime
 - Simpler IPC — no JSON-RPC parsing, direct method calls
 - Richer integration — full access to `AgentSession` events, state, and tools
 
@@ -88,7 +89,6 @@ Parameters:
 ### Open Questions
 
 - Should conversation history be preserved across cwd switches? (Currently starts fresh)
-- Should there be a `worktree_return` tool to switch back to the original cwd?
 - Memory pressure with many concurrent agents in one process?
 - Extension loading in agent sessions — should they load the same extensions as the lead?
 

@@ -2,11 +2,11 @@
  * Team Agents Extension (SDK-based prototype)
  *
  * Replaces RPC subprocess spawning with in-process AgentSessionRuntime,
- * enabling cwd switching (e.g., into git worktrees) without restarting agents.
+ * enabling cwd switching without restarting agents.
  *
  * Key changes from the original:
  * - Agents run as in-process AgentSession instances via createAgentSessionRuntime()
- * - New worktree_switch tool: creates a worktree and switches an agent's cwd to it
+ * - agent_switch_cwd tool: switches an agent's working directory to any path
  * - The runtime factory pattern allows rebuilding cwd-bound services on the fly
  *
  * Architecture:
@@ -14,8 +14,8 @@
  *   re-invoked for a different cwd
  * - The factory closes over fixed inputs (auth, model) and recreates
  *   cwd-bound services (resource loader, settings, tools, extensions)
- * - When switching to a worktree, we dispose the old runtime and create
- *   a new one at the worktree path using the same factory
+ * - When switching cwd, we dispose the old runtime and create a new one
+ *   at the target path using the same factory
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -71,7 +71,6 @@ interface TeamMember {
 	prompt?: string;
 	joinedAt: number;
 	cwd: string;
-	worktreePath?: string;
 	isActive?: boolean;
 }
 
@@ -236,13 +235,12 @@ async function addMemberToTeamFile(cwd: string, teamName: string, member: TeamMe
 	await writeTeamFile(cwd, teamName, teamFile);
 }
 
-async function updateMemberCwd(cwd: string, teamName: string, memberName: string, newCwd: string, worktreePath?: string): Promise<void> {
+async function updateMemberCwd(cwd: string, teamName: string, memberName: string, newCwd: string): Promise<void> {
 	const teamFile = await readTeamFileAsync(cwd, teamName);
 	if (!teamFile) return;
 	const member = teamFile.members.find((m) => m.name === memberName);
 	if (!member) return;
 	member.cwd = newCwd;
-	if (worktreePath) member.worktreePath = worktreePath;
 	await writeTeamFile(cwd, teamName, teamFile);
 }
 
@@ -770,77 +768,6 @@ async function promptAgent(agent: InProcessAgent, message: string, timeout = 120
 }
 
 // ============================================================================
-// Worktree Helpers
-// ============================================================================
-
-async function createWorktree(
-	pi: ExtensionAPI,
-	cwd: string,
-	name: string | undefined,
-	branchFrom: string | undefined,
-): Promise<{ ok: true; worktreePath: string; branch: string; name: string } | { ok: false; error: string }> {
-	const gitCheck = await pi.exec("git", ["rev-parse", "--git-dir"], { cwd });
-	if (gitCheck.code !== 0) {
-		return { ok: false, error: "Not in a git repository." };
-	}
-
-	const rootResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
-	if (rootResult.code !== 0) {
-		return { ok: false, error: "Failed to determine git root." };
-	}
-	const gitRoot = rootResult.stdout.trim();
-
-	const ADJECTIVES = ["bold", "calm", "cool", "dark", "deep", "fair", "fast", "fine", "keen", "kind", "neat", "pure", "rare", "safe", "slim", "soft", "warm", "wide", "wild", "wise"];
-	const NOUNS = ["arch", "bear", "bell", "bird", "cave", "crow", "dawn", "deer", "dove", "dusk", "elm", "fern", "fish", "hawk", "iris", "jade", "lark", "lynx", "moss", "oak", "owl", "peak", "pine", "reed", "rose", "sage", "swan", "tide", "vale", "vine", "wren"];
-
-	function generateName(): string {
-		const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-		const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
-		const suffix = Math.random().toString(36).slice(2, 6);
-		return `${adj}-${noun}-${suffix}`;
-	}
-
-	const worktreeName = name || generateName();
-	const branch = `worktree/${worktreeName}`;
-	const worktreePath = join(gitRoot, ".pi/worktrees", worktreeName);
-	const ref = branchFrom || "HEAD";
-
-	let addResult = await pi.exec("git", ["worktree", "add", worktreePath, "-b", branch, ref], { cwd });
-
-	if (addResult.code !== 0 && addResult.stderr.includes("already exists")) {
-		const retryName = generateName();
-		const retryBranch = `worktree/${retryName}`;
-		const retryPath = join(gitRoot, ".pi/worktrees", retryName);
-		addResult = await pi.exec("git", ["worktree", "add", retryPath, "-b", retryBranch, ref], { cwd });
-		if (addResult.code !== 0) {
-			return { ok: false, error: `Failed to create worktree: ${addResult.stderr}` };
-		}
-		await syncWorktreeSettings(gitRoot, retryPath, pi);
-		return { ok: true, worktreePath: retryPath, branch: retryBranch, name: retryName };
-	}
-
-	if (addResult.code !== 0) {
-		return { ok: false, error: `Failed to create worktree: ${addResult.stderr}` };
-	}
-
-	await syncWorktreeSettings(gitRoot, worktreePath, pi);
-	return { ok: true, worktreePath, branch, name: worktreeName };
-}
-
-async function syncWorktreeSettings(gitRoot: string, worktreePath: string, pi: ExtensionAPI): Promise<void> {
-	const piDir = join(gitRoot, ".pi");
-	const destDir = join(worktreePath, ".pi");
-	await pi.exec("mkdir", ["-p", destDir]);
-
-	for (const item of ["extensions", "prompts", "skills", "settings.json"]) {
-		const src = join(piDir, item);
-		const check = await pi.exec("test", ["-e", src]);
-		if (check.code !== 0) continue;
-		await pi.exec("cp", ["-r", src, join(destDir, item)]);
-	}
-}
-
-// ============================================================================
 // Inbox Polling (adapted for in-process agents)
 // ============================================================================
 
@@ -1148,26 +1075,25 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ========================================================================
-	// Tool: worktree_switch — NEW! The key feature this prototype enables
+	// Tool: agent_switch_cwd — switch an agent's working directory
 	// ========================================================================
 
 	pi.registerTool({
-		name: "worktree_switch",
-		label: "Switch Agent to Worktree",
+		name: "agent_switch_cwd",
+		label: "Switch Agent Working Directory",
 		description:
-			"Create a git worktree and switch a teammate's working directory to it. " +
-			"This allows agents to work in isolation on branches without affecting the main repo. " +
-			"The agent's session is recreated at the new cwd with fresh context.",
-		promptSnippet: "Create a worktree and switch an agent to work in it",
+			"Switch a teammate's working directory to a different path. " +
+			"The agent's session is recreated at the new cwd with fresh context. " +
+			"Use this after creating a worktree to move an agent into it, or to point an agent at a subdirectory.",
+		promptSnippet: "Switch an agent's working directory to a different path",
 		promptGuidelines: [
-			"Use worktree_switch to isolate an agent's work on a separate branch.",
-			"The agent gets a fresh session at the worktree path with all cwd-bound services rebuilt.",
+			"Use agent_switch_cwd after worktree_create to move an agent into the new worktree.",
+			"The agent gets a fresh session with all cwd-bound services rebuilt for the new path.",
 			"After switching, send the agent new instructions via send_message.",
 		],
 		parameters: Type.Object({
 			agent_name: Type.String({ description: "Name of the teammate to switch" }),
-			worktree_name: Type.Optional(Type.String({ description: "Worktree name (random if omitted)" })),
-			branch_from: Type.Optional(Type.String({ description: "Git ref to branch from (defaults to HEAD)" })),
+			cwd: Type.String({ description: "New working directory path (absolute)" }),
 			initial_prompt: Type.Optional(Type.String({ description: "Instructions to send after switching" })),
 		}),
 
@@ -1182,6 +1108,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			const targetCwd = resolve(params.cwd);
+
+			// Verify target exists
+			if (!existsSync(targetCwd)) {
+				return {
+					content: [{ type: "text" as const, text: `Directory does not exist: ${targetCwd}` }],
+					details: {},
+				};
+			}
+
 			// Wait for agent to finish current work
 			if (agent.isBusy) {
 				try {
@@ -1191,25 +1127,15 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// Create the worktree
-			const wtResult = await createWorktree(pi, ctx.cwd, params.worktree_name, params.branch_from);
-			if (!wtResult.ok) {
-				return {
-					content: [{ type: "text" as const, text: `Failed to create worktree: ${wtResult.error}` }],
-					details: {},
-				};
-			}
-
-			// Switch the agent to the worktree cwd
 			const oldCwd = agent.currentCwd;
 			try {
-				await switchAgentCwd(agent, wtResult.worktreePath);
+				await switchAgentCwd(agent, targetCwd);
 			} catch (err: unknown) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Worktree created but failed to switch agent: ${err instanceof Error ? err.message : String(err)}\nWorktree path: ${wtResult.worktreePath}`,
+							text: `Failed to switch agent cwd: ${err instanceof Error ? err.message : String(err)}`,
 						},
 					],
 					details: {},
@@ -1217,7 +1143,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Update team config with new cwd
-			await updateMemberCwd(ctx.cwd, teamName, params.agent_name, wtResult.worktreePath, wtResult.worktreePath);
+			await updateMemberCwd(ctx.cwd, teamName, params.agent_name, targetCwd);
 
 			// Send initial instructions if provided
 			if (params.initial_prompt) {
@@ -1228,12 +1154,11 @@ export default function (pi: ExtensionAPI) {
 						from: TEAM_LEAD_NAME,
 						text: params.initial_prompt,
 						timestamp: new Date().toISOString(),
-						summary: "Instructions after worktree switch",
+						summary: "Instructions after cwd switch",
 					},
 					teamName,
 				);
 
-				// Prompt the agent directly
 				agent.runtime.session.prompt(params.initial_prompt).catch(() => {
 					// Will be picked up via inbox polling
 				});
@@ -1244,20 +1169,15 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text" as const,
 						text:
-							`Agent "${params.agent_name}" switched to worktree:\n` +
-							`  Worktree: ${wtResult.name}\n` +
-							`  Branch: ${wtResult.branch}\n` +
-							`  Path: ${wtResult.worktreePath}\n` +
+							`Agent "${params.agent_name}" switched to: ${targetCwd}\n` +
 							`  Previous cwd: ${oldCwd}\n\n` +
-							`Agent now has fresh context bound to the worktree directory.\n` +
+							`Agent now has fresh context bound to the new directory.\n` +
 							`Tools, extensions, and settings are all resolved from the new cwd.`,
 					},
 				],
 				details: {
 					agentName: params.agent_name,
-					worktreeName: wtResult.name,
-					worktreePath: wtResult.worktreePath,
-					branch: wtResult.branch,
+					newCwd: targetCwd,
 					oldCwd,
 				},
 			};
@@ -1302,7 +1222,7 @@ export default function (pi: ExtensionAPI) {
 					? ` [tasks: ${ownedTasks.map((t) => `#${t.id}`).join(", ")}]`
 					: "";
 
-				const cwdInfo = member.worktreePath ? ` worktree:${member.worktreePath}` : "";
+				const cwdInfo = member.cwd !== ctx.cwd ? ` cwd:${member.cwd}` : "";
 
 				lines.push(`  ${member.name} (${status})${taskInfo}${member.model ? ` model:${member.model}` : ""}${cwdInfo}`);
 			}
@@ -1638,7 +1558,7 @@ export default function (pi: ExtensionAPI) {
 					: agent?.isRunning
 						? (agent.isBusy ? "busy" : "idle")
 						: "stopped";
-				lines.push(`  ${member.name}: ${status}${member.agentType ? ` (${member.agentType})` : ""}${member.worktreePath ? ` [worktree: ${member.worktreePath}]` : ""}`);
+				lines.push(`  ${member.name}: ${status}${member.agentType ? ` (${member.agentType})` : ""}${member.cwd !== ctx.cwd ? ` [cwd: ${member.cwd}]` : ""}`);
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
 		},

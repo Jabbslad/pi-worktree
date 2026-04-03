@@ -228,29 +228,48 @@ async function writeTeamFile(cwd: string, teamName: string, teamFile: TeamFile):
 	await writeFile(getTeamFilePath(cwd, teamName), JSON.stringify(teamFile, null, 2));
 }
 
+function getTeamFileLockPath(cwd: string, teamName: string): string {
+	return `${getTeamFilePath(cwd, teamName)}.lockdir`;
+}
+
 async function addMemberToTeamFile(cwd: string, teamName: string, member: TeamMember): Promise<void> {
-	const teamFile = await readTeamFileAsync(cwd, teamName);
-	if (!teamFile) throw new Error(`Team "${teamName}" not found`);
-	teamFile.members.push(member);
-	await writeTeamFile(cwd, teamName, teamFile);
+	const release = await acquireLock(getTeamFileLockPath(cwd, teamName), 30, 5, 100);
+	try {
+		const teamFile = await readTeamFileAsync(cwd, teamName);
+		if (!teamFile) throw new Error(`Team "${teamName}" not found`);
+		teamFile.members.push(member);
+		await writeTeamFile(cwd, teamName, teamFile);
+	} finally {
+		await release();
+	}
 }
 
 async function updateMemberCwd(cwd: string, teamName: string, memberName: string, newCwd: string): Promise<void> {
-	const teamFile = await readTeamFileAsync(cwd, teamName);
-	if (!teamFile) return;
-	const member = teamFile.members.find((m) => m.name === memberName);
-	if (!member) return;
-	member.cwd = newCwd;
-	await writeTeamFile(cwd, teamName, teamFile);
+	const release = await acquireLock(getTeamFileLockPath(cwd, teamName), 30, 5, 100);
+	try {
+		const teamFile = await readTeamFileAsync(cwd, teamName);
+		if (!teamFile) return;
+		const member = teamFile.members.find((m) => m.name === memberName);
+		if (!member) return;
+		member.cwd = newCwd;
+		await writeTeamFile(cwd, teamName, teamFile);
+	} finally {
+		await release();
+	}
 }
 
 async function setMemberActive(cwd: string, teamName: string, memberName: string, isActive: boolean): Promise<void> {
-	const teamFile = await readTeamFileAsync(cwd, teamName);
-	if (!teamFile) return;
-	const member = teamFile.members.find((m) => m.name === memberName);
-	if (!member) return;
-	member.isActive = isActive;
-	await writeTeamFile(cwd, teamName, teamFile);
+	const release = await acquireLock(getTeamFileLockPath(cwd, teamName), 30, 5, 100);
+	try {
+		const teamFile = await readTeamFileAsync(cwd, teamName);
+		if (!teamFile) return;
+		const member = teamFile.members.find((m) => m.name === memberName);
+		if (!member) return;
+		member.isActive = isActive;
+		await writeTeamFile(cwd, teamName, teamFile);
+	} finally {
+		await release();
+	}
 }
 
 // ============================================================================
